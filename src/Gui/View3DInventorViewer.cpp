@@ -815,7 +815,6 @@ View3DInventorViewer::~View3DInventorViewer()
 
     if (_viewerPy) {
         static_cast<View3DInventorViewerPy*>(_viewerPy)->_viewer = nullptr;
-        Py_DECREF(_viewerPy);
     }
 
     // In the init() function we have overridden the default SoGLRenderAction with our
