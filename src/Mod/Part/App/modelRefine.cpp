@@ -24,8 +24,10 @@
 
 
 #include <algorithm>
+#include <functional>
 #include <numbers>
 #include <iterator>
+#include <unordered_map>
 #include <Bnd_Box.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
@@ -73,6 +75,17 @@
 
 
 using namespace ModelRefine;
+
+namespace {
+inline void hashCombine(size_t& seed, size_t v)
+{
+    seed ^= v + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+inline size_t quantize(double v, double grid = 1e-4)
+{
+    return std::hash<long long>{}(static_cast<long long>(std::round(v / grid)));
+}
+}  // namespace
 
 
 void ModelRefine::getFaceEdges(const TopoDS_Face& face, EdgeVectorType& edges)
@@ -255,32 +268,39 @@ void FaceAdjacencySplitter::recursiveFind(const TopoDS_Face& face, FaceVectorTyp
 
 void FaceEqualitySplitter::split(const FaceVectorType& faces, FaceTypedBase* object)
 {
-    std::vector<FaceVectorType> tempVector;
-    tempVector.reserve(faces.size());
-    FaceVectorType::const_iterator faceIt;
-    for (faceIt = faces.begin(); faceIt != faces.end(); ++faceIt) {
-        bool foundMatch(false);
-        std::vector<FaceVectorType>::iterator tempIt;
-        for (tempIt = tempVector.begin(); tempIt != tempVector.end(); ++tempIt) {
-            if (object->isEqual((*tempIt).front(), *faceIt)) {
-                (*tempIt).push_back(*faceIt);
-                foundMatch = true;
-                break;
-            }
-        }
-        if (!foundMatch) {
-            FaceVectorType another;
-            another.reserve(faces.size());
-            another.push_back(*faceIt);
-            tempVector.push_back(another);
-        }
+    // Group faces by hash first to avoid expensive pairwise isEqual calls.
+    // Faces with different hashes are guaranteed unequal; only faces within
+    // the same hash bucket need pairwise comparison.
+    std::unordered_map<size_t, FaceVectorType> hashBuckets;
+    for (const auto& face : faces) {
+        size_t h = object->computeHash(face);
+        hashBuckets[h].push_back(face);
     }
-    std::vector<FaceVectorType>::iterator it;
-    for (it = tempVector.begin(); it != tempVector.end(); ++it) {
-        if ((*it).size() < 2) {
+
+    for (auto& [hash, bucket] : hashBuckets) {
+        if (bucket.size() < 2) {
             continue;
         }
-        equalityVector.push_back(*it);
+        // Within each bucket, do pairwise equality grouping
+        std::vector<FaceVectorType> groups;
+        for (const auto& face : bucket) {
+            bool foundMatch = false;
+            for (auto& group : groups) {
+                if (object->isEqual(group.front(), face)) {
+                    group.push_back(face);
+                    foundMatch = true;
+                    break;
+                }
+            }
+            if (!foundMatch) {
+                groups.emplace_back(FaceVectorType{face});
+            }
+        }
+        for (auto& group : groups) {
+            if (group.size() >= 2) {
+                equalityVector.push_back(std::move(group));
+            }
+        }
     }
 }
 
@@ -380,6 +400,25 @@ bool FaceTypedPlane::isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& face
         )
         && planeOne.Distance(planeTwo.Position().Location()) < Precision::Confusion()
     );
+}
+
+size_t FaceTypedPlane::computeHash(const TopoDS_Face& face) const
+{
+    Handle(Geom_Plane) planeSurface = getGeomPlane(face);
+    if (planeSurface.IsNull()) {
+        return 0;
+    }
+    gp_Pln pln = planeSurface->Pln();
+    const gp_Dir& dir = pln.Position().Direction();
+    double dist = pln.Distance(gp_Pnt(0, 0, 0));
+
+    size_t h = 0;
+    // Hash absolute direction components (parallel normals may point opposite ways)
+    hashCombine(h, quantize(fabs(dir.X())));
+    hashCombine(h, quantize(fabs(dir.Y())));
+    hashCombine(h, quantize(fabs(dir.Z())));
+    hashCombine(h, quantize(dist));
+    return h;
 }
 
 GeomAbs_SurfaceType FaceTypedPlane::getType() const
@@ -489,6 +528,24 @@ bool FaceTypedCylinder::isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& f
     }
 
     return true;
+}
+
+size_t FaceTypedCylinder::computeHash(const TopoDS_Face& face) const
+{
+    Handle(Geom_CylindricalSurface) surface = getGeomCylinder(face);
+    if (surface.IsNull()) {
+        return 0;
+    }
+    gp_Cylinder cyl = surface->Cylinder();
+    const gp_Dir& dir = cyl.Axis().Direction();
+
+    size_t h = 0;
+    hashCombine(h, quantize(cyl.Radius()));
+    // Hash absolute direction components (coaxial axes may point opposite ways)
+    hashCombine(h, quantize(fabs(dir.X())));
+    hashCombine(h, quantize(fabs(dir.Y())));
+    hashCombine(h, quantize(fabs(dir.Z())));
+    return h;
 }
 
 GeomAbs_SurfaceType FaceTypedCylinder::getType() const
@@ -857,6 +914,40 @@ FaceTypedBSpline::FaceTypedBSpline()
     : FaceTypedBase(GeomAbs_BSplineSurface)
 {}
 
+size_t FaceTypedBSpline::computeHash(const TopoDS_Face& face) const
+{
+    Handle(Geom_BSplineSurface)
+        surface = Handle(Geom_BSplineSurface)::DownCast(BRep_Tool::Surface(face));
+    if (surface.IsNull()) {
+        return 0;
+    }
+
+    size_t h = 0;
+    hashCombine(h, std::hash<int>{}(surface->UDegree()));
+    hashCombine(h, std::hash<int>{}(surface->VDegree()));
+    hashCombine(h, std::hash<int>{}(surface->NbUPoles()));
+    hashCombine(h, std::hash<int>{}(surface->NbVPoles()));
+    hashCombine(h, std::hash<int>{}(surface->NbUKnots()));
+    hashCombine(h, std::hash<int>{}(surface->NbVKnots()));
+
+    unsigned flags = 0;
+    if (surface->IsURational()) flags |= 1;
+    if (surface->IsVRational()) flags |= 2;
+    if (surface->IsUPeriodic()) flags |= 4;
+    if (surface->IsVPeriodic()) flags |= 8;
+    if (surface->IsUClosed())   flags |= 16;
+    if (surface->IsVClosed())   flags |= 32;
+    hashCombine(h, std::hash<unsigned>{}(flags));
+
+    // First pole discriminates rotated copies (cheap — no array allocation)
+    gp_Pnt p = surface->Pole(1, 1);
+    hashCombine(h, quantize(p.X()));
+    hashCombine(h, quantize(p.Y()));
+    hashCombine(h, quantize(p.Z()));
+
+    return h;
+}
+
 bool FaceTypedBSpline::isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& faceTwo) const
 {
     try {
@@ -1134,12 +1225,8 @@ bool FaceUniter::process()
         for (std::size_t indexEquality(0); indexEquality < equalitySplitter.getGroupCount();
              ++indexEquality) {
             adjacencySplitter.split(equalitySplitter.getGroup(indexEquality));
-            //            std::cout << "      adjacency group count: " <<
-            //            adjacencySplitter.getGroupCount() << std::endl;
             for (std::size_t adjacentIndex(0); adjacentIndex < adjacencySplitter.getGroupCount();
                  ++adjacentIndex) {
-                //                    std::cout << "         face count is: " <<
-                //                    adjacencySplitter.getGroup(adjacentIndex).size() << std::endl;
                 TopoDS_Face newFace = (*typeIt)->buildFace(adjacencySplitter.getGroup(adjacentIndex));
                 if (!newFace.IsNull()) {
                     // the created face should have the same orientation as the input faces
