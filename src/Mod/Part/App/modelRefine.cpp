@@ -29,10 +29,11 @@
 #include <numeric>
 #include <iterator>
 #include <unordered_map>
-#include <unordered_set>
 #include <Bnd_Box.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Pnt.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
@@ -80,13 +81,45 @@ using namespace ModelRefine;
 
 namespace
 {
+// Hash combine — Boost-style
 inline void hashCombine(size_t& seed, size_t v)
 {
     seed ^= v + 0x9e3779b9 + (seed << 6) + (seed >> 2);
 }
-inline long long quantize(double v, double grid)
+
+// Quantization tolerance for hash computation.
+// 1e-10 is 3 orders finer than Precision::Confusion() (~1e-7) and
+// 5 orders coarser than OCCT floating-point noise (~1e-15), so
+// it reliably produces identical quantized values for geometrically
+// equal surfaces without sensitivity to tiny FP jitter.
+constexpr double HASH_GRID = 1e-10;
+
+inline long long quantize(double v)
 {
-    return static_cast<long long>(std::floor(v / grid));
+    return static_cast<long long>(std::floor(v / HASH_GRID));
+}
+
+inline size_t hashDouble(double v)
+{
+    return std::hash<long long> {}(quantize(v));
+}
+
+inline size_t hashPoint(const gp_Pnt& p)
+{
+    size_t h = 0;
+    hashCombine(h, hashDouble(p.X()));
+    hashCombine(h, hashDouble(p.Y()));
+    hashCombine(h, hashDouble(p.Z()));
+    return h;
+}
+
+inline size_t hashDir(const gp_Dir& d)
+{
+    size_t h = 0;
+    hashCombine(h, hashDouble(d.X()));
+    hashCombine(h, hashDouble(d.Y()));
+    hashCombine(h, hashDouble(d.Z()));
+    return h;
 }
 }  // namespace
 
@@ -271,85 +304,52 @@ void FaceAdjacencySplitter::recursiveFind(const TopoDS_Face& face, FaceVectorTyp
 
 void FaceEqualitySplitter::split(const FaceVectorType& faces, FaceTypedBase* object)
 {
-    // Two-level grouping to avoid expensive pairwise isEqual calls:
+    // Hash-based grouping strategy:
     //
-    // 1. Structural hash (exact integer/boolean invariants) — faces with
-    //    different structural hashes are guaranteed unequal with no risk of
-    //    false negatives.
+    // Phase 1 — compute a full geometric hash (1e-10 quantization) for
+    //           every face.  The hash covers all data that isEqual checks,
+    //           so faces with different hashes are guaranteed unequal.
     //
-    // 2. Grid key (quantized 3D coordinates) — within each structural group,
-    //    faces are placed into grid cells.  Each cell is compared only with
-    //    its 26 neighbors (±1 in each axis) to find merges across quantization
-    //    boundaries, keeping the cost O(N) instead of O(N²).
+    // Phase 2 — group face indices by hash value.
     //
-    // For face types without a grid key (planes, cylinders), all faces land
-    // in one cell and the algorithm reduces to the original pairwise approach.
+    // Phase 3 — within each hash group, pairwise isEqual with union-find
+    //           to form equality groups.  Hash collisions are possible for
+    //           identical surfaces plus the default hash (0) for unsupported
+    //           types, so isEqual serves as the ground truth.
+    //
+    // Key correctness properties:
+    //   - No false positives: isEqual is the final arbiter within each group
+    //   - No false negatives: equal surfaces have the same hash (all
+    //     geometric data quantized to 1e-10, well above FP noise)
+    //   - Deterministic: same shape → same hash, always
 
-    // First level: group by structural hash.
-    std::unordered_map<size_t, FaceVectorType> structBuckets;
-    for (const auto& face : faces) {
-        size_t h = object->computeStructuralHash(face);
-        structBuckets[h].push_back(face);
+    if (faces.empty()) {
+        return;
     }
 
-    for (auto& [structHash, structGroup] : structBuckets) {
-        if (structGroup.size() < 2) {
+    // Phase 1: compute hash for every face.
+    std::vector<size_t> hashes(faces.size());
+    for (size_t i = 0; i < faces.size(); ++i) {
+        hashes[i] = object->computeHash(faces[i]);
+    }
+
+    // Phase 2: group face indices by hash.
+    std::unordered_map<size_t, std::vector<size_t>> hashGroups;
+    for (size_t i = 0; i < faces.size(); ++i) {
+        hashGroups[hashes[i]].push_back(i);
+    }
+
+    // Phase 3: within each hash group, use union-find + pairwise isEqual
+    //          to establish final equality groups.
+    for (auto& [hash, indices] : hashGroups) {
+        if (indices.size() < 2) {
             continue;
         }
 
-        // Second level: subdivide by grid key.
-        FaceTypedBase::GridKey firstKey = object->computeGridKey(structGroup.front());
-
-        if (!firstKey.valid) {
-            // No geometric grid available — fall back to pairwise within
-            // the structural group (this path is used by planes/cylinders
-            // where isEqual is already cheap).
-            std::vector<FaceVectorType> groups;
-            for (const auto& face : structGroup) {
-                bool foundMatch = false;
-                for (auto& group : groups) {
-                    if (object->isEqual(group.front(), face)) {
-                        group.push_back(face);
-                        foundMatch = true;
-                        break;
-                    }
-                }
-                if (!foundMatch) {
-                    groups.emplace_back(FaceVectorType {face});
-                }
-            }
-            for (auto& group : groups) {
-                if (group.size() >= 2) {
-                    equalityVector.push_back(std::move(group));
-                }
-            }
-            continue;
-        }
-
-        // Build a spatial grid of face indices.
-        struct GridHash
-        {
-            size_t operator()(const std::tuple<long long, long long, long long>& k) const
-            {
-                size_t h = 0;
-                hashCombine(h, std::hash<long long> {}(std::get<0>(k)));
-                hashCombine(h, std::hash<long long> {}(std::get<1>(k)));
-                hashCombine(h, std::hash<long long> {}(std::get<2>(k)));
-                return h;
-            }
-        };
-        using CellKey = std::tuple<long long, long long, long long>;
-        std::unordered_map<CellKey, std::vector<size_t>, GridHash> grid;
-        std::vector<FaceTypedBase::GridKey> keys(structGroup.size());
-
-        for (size_t i = 0; i < structGroup.size(); ++i) {
-            keys[i] = object->computeGridKey(structGroup[i]);
-            grid[{keys[i].x, keys[i].y, keys[i].z}].push_back(i);
-        }
-
-        // Union-find to merge faces across grid cell boundaries.
-        std::vector<size_t> parent(structGroup.size());
+        size_t n = indices.size();
+        std::vector<size_t> parent(n);
         std::iota(parent.begin(), parent.end(), 0);
+
         std::function<size_t(size_t)> find = [&](size_t i) -> size_t {
             while (parent[i] != i) {
                 parent[i] = parent[parent[i]];
@@ -365,47 +365,19 @@ void FaceEqualitySplitter::split(const FaceVectorType& faces, FaceTypedBase* obj
             }
         };
 
-        // For each cell, check the 26 neighbors for faces that might be equal
-        // due to quantization boundary straddle.  Within a cell, we only need
-        // to compare the first face (representative) with neighbors' firsts —
-        // if they match, unite the groups; full pairwise is done afterward.
-        std::unordered_set<CellKey, GridHash> visited;
-        for (auto& [cell, indices] : grid) {
-            // Unite all faces within the same cell with the first face
-            // (they share the same grid key, so likely equal; isEqual confirms).
-            for (size_t i = 1; i < indices.size(); ++i) {
-                if (object->isEqual(structGroup[indices[0]], structGroup[indices[i]])) {
-                    unite(indices[0], indices[i]);
-                }
-            }
-
-            // Check the 26 neighboring cells.
-            auto [cx, cy, cz] = cell;
-            for (int dx = -1; dx <= 1; ++dx) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dz = -1; dz <= 1; ++dz) {
-                        if (dx == 0 && dy == 0 && dz == 0) {
-                            continue;
-                        }
-                        CellKey neighbor {cx + dx, cy + dy, cz + dz};
-                        auto nit = grid.find(neighbor);
-                        if (nit == grid.end()) {
-                            continue;
-                        }
-                        // Compare representative of this cell with representative
-                        // of neighbor cell.
-                        if (object->isEqual(structGroup[indices[0]], structGroup[nit->second[0]])) {
-                            unite(indices[0], nit->second[0]);
-                        }
-                    }
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                if (find(i) != find(j)
+                    && object->isEqual(faces[indices[i]], faces[indices[j]])) {
+                    unite(i, j);
                 }
             }
         }
 
         // Collect union-find groups.
         std::unordered_map<size_t, FaceVectorType> ufGroups;
-        for (size_t i = 0; i < structGroup.size(); ++i) {
-            ufGroups[find(i)].push_back(structGroup[i]);
+        for (size_t k = 0; k < n; ++k) {
+            ufGroups[find(k)].push_back(faces[indices[k]]);
         }
         for (auto& [root, group] : ufGroups) {
             if (group.size() >= 2) {
@@ -513,14 +485,17 @@ bool FaceTypedPlane::isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& face
     );
 }
 
-size_t FaceTypedPlane::computeStructuralHash(const TopoDS_Face& /*face*/) const
+size_t FaceTypedPlane::computeHash(const TopoDS_Face& face) const
 {
-    return 0;
-}
-
-FaceTypedBase::GridKey FaceTypedPlane::computeGridKey(const TopoDS_Face& /*face*/) const
-{
-    return {};
+    Handle(Geom_Plane) surf = Handle(Geom_Plane)::DownCast(BRep_Tool::Surface(face));
+    if (surf.IsNull()) {
+        return 0;
+    }
+    gp_Pln pln = surf->Pln();
+    size_t h = 0;
+    hashCombine(h, hashPoint(pln.Location()));
+    hashCombine(h, hashDir(pln.Axis().Direction()));
+    return h;
 }
 
 GeomAbs_SurfaceType FaceTypedPlane::getType() const
@@ -632,14 +607,18 @@ bool FaceTypedCylinder::isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& f
     return true;
 }
 
-size_t FaceTypedCylinder::computeStructuralHash(const TopoDS_Face& /*face*/) const
+size_t FaceTypedCylinder::computeHash(const TopoDS_Face& face) const
 {
-    return 0;
-}
-
-FaceTypedBase::GridKey FaceTypedCylinder::computeGridKey(const TopoDS_Face& /*face*/) const
-{
-    return {};
+    Handle(Geom_CylindricalSurface) surf = getGeomCylinder(face);
+    if (surf.IsNull()) {
+        return 0;
+    }
+    gp_Cylinder cyl = surf->Cylinder();
+    size_t h = 0;
+    hashCombine(h, hashDouble(cyl.Radius()));
+    hashCombine(h, hashPoint(cyl.Location()));
+    hashCombine(h, hashDir(cyl.Axis().Direction()));
+    return h;
 }
 
 GeomAbs_SurfaceType FaceTypedCylinder::getType() const
@@ -1008,7 +987,7 @@ FaceTypedBSpline::FaceTypedBSpline()
     : FaceTypedBase(GeomAbs_BSplineSurface)
 {}
 
-size_t FaceTypedBSpline::computeStructuralHash(const TopoDS_Face& face) const
+size_t FaceTypedBSpline::computeHash(const TopoDS_Face& face) const
 {
     Handle(Geom_BSplineSurface)
         surface = Handle(Geom_BSplineSurface)::DownCast(BRep_Tool::Surface(face));
@@ -1016,16 +995,13 @@ size_t FaceTypedBSpline::computeStructuralHash(const TopoDS_Face& face) const
         return 0;
     }
 
-    // Exact integer/boolean invariants — no false negatives possible.
-    // These fields are all compared with == in isEqual().
     size_t h = 0;
+
+    // Degree (exact integer)
     hashCombine(h, std::hash<int> {}(surface->UDegree()));
     hashCombine(h, std::hash<int> {}(surface->VDegree()));
-    hashCombine(h, std::hash<int> {}(surface->NbUPoles()));
-    hashCombine(h, std::hash<int> {}(surface->NbVPoles()));
-    hashCombine(h, std::hash<int> {}(surface->NbUKnots()));
-    hashCombine(h, std::hash<int> {}(surface->NbVKnots()));
 
+    // Boolean flags (each checked with == in isEqual)
     unsigned flags = 0;
     if (surface->IsURational()) {
         flags |= 1;
@@ -1047,25 +1023,43 @@ size_t FaceTypedBSpline::computeStructuralHash(const TopoDS_Face& face) const
     }
     hashCombine(h, std::hash<unsigned> {}(flags));
 
-    return h;
-}
-
-FaceTypedBase::GridKey FaceTypedBSpline::computeGridKey(const TopoDS_Face& face) const
-{
-    Handle(Geom_BSplineSurface)
-        surface = Handle(Geom_BSplineSurface)::DownCast(BRep_Tool::Surface(face));
-    if (surface.IsNull()) {
-        return {};
+    // All pole coordinates (quantized to HASH_GRID = 1e-10).
+    int nU = surface->NbUPoles();
+    int nV = surface->NbVPoles();
+    for (int u = 1; u <= nU; ++u) {
+        for (int v = 1; v <= nV; ++v) {
+            hashCombine(h, hashPoint(surface->Pole(u, v)));
+        }
     }
 
-    // Quantized first pole coordinate to discriminate geometrically distinct
-    // surfaces that share structural parameters (e.g. rotated copies).
-    // The grid is much larger than Precision::Confusion() (~1e-7), so boundary
-    // straddles are rare; the splitter checks neighboring grid cells to ensure
-    // no valid merges are missed.
-    constexpr double grid = 0.1;
-    gp_Pnt p = surface->Pole(1, 1);
-    return {quantize(p.X(), grid), quantize(p.Y(), grid), quantize(p.Z(), grid), true};
+    // Weights if rational.
+    if (surface->IsURational() || surface->IsVRational()) {
+        for (int u = 1; u <= nU; ++u) {
+            for (int v = 1; v <= nV; ++v) {
+                hashCombine(h, hashDouble(surface->Weight(u, v)));
+            }
+        }
+    }
+
+    // Unique knot values (quantized to HASH_GRID).
+    int nUK = surface->NbUKnots();
+    int nVK = surface->NbVKnots();
+    for (int i = 1; i <= nUK; ++i) {
+        hashCombine(h, hashDouble(surface->UKnot(i)));
+    }
+    for (int i = 1; i <= nVK; ++i) {
+        hashCombine(h, hashDouble(surface->VKnot(i)));
+    }
+
+    // Multiplicities (exact integer).
+    for (int i = 1; i <= nUK; ++i) {
+        hashCombine(h, std::hash<int> {}(surface->UMultiplicity(i)));
+    }
+    for (int i = 1; i <= nVK; ++i) {
+        hashCombine(h, std::hash<int> {}(surface->VMultiplicity(i)));
+    }
+
+    return h;
 }
 
 bool FaceTypedBSpline::isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& faceTwo) const

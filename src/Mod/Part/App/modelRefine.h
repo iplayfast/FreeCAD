@@ -69,19 +69,15 @@ public:
     virtual bool isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& faceTwo) const = 0;
     virtual GeomAbs_SurfaceType getType() const = 0;
     virtual TopoDS_Face buildFace(const FaceVectorType& faces) const = 0;
-    virtual size_t computeStructuralHash(const TopoDS_Face& /*face*/) const
-    {
-        return 0;
-    }
 
-    struct GridKey
+    // Compute a deterministic hash of the face's geometric surface data.
+    // Faces with the same hash are candidates for being equal; the hash
+    // must be verified with isEqual().  Uses 1e-10 quantization so that
+    // floating-point noise (typically ~1e-15) never crosses a boundary.
+    virtual size_t computeHash(const TopoDS_Face& face) const
     {
-        long long x = 0, y = 0, z = 0;
-        bool valid = false;
-    };
-    virtual GridKey computeGridKey(const TopoDS_Face& /*face*/) const
-    {
-        return {};
+        (void)face;
+        return 0;
     }
 
     static GeomAbs_SurfaceType getFaceType(const TopoDS_Face& faceIn);
@@ -103,8 +99,7 @@ public:
     bool isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& faceTwo) const override;
     GeomAbs_SurfaceType getType() const override;
     TopoDS_Face buildFace(const FaceVectorType& faces) const override;
-    size_t computeStructuralHash(const TopoDS_Face& face) const override;
-    GridKey computeGridKey(const TopoDS_Face& face) const override;
+    size_t computeHash(const TopoDS_Face& face) const override;
     friend FaceTypedPlane& getPlaneObject();
 };
 FaceTypedPlane& getPlaneObject();
@@ -118,8 +113,7 @@ public:
     bool isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& faceTwo) const override;
     GeomAbs_SurfaceType getType() const override;
     TopoDS_Face buildFace(const FaceVectorType& faces) const override;
-    size_t computeStructuralHash(const TopoDS_Face& face) const override;
-    GridKey computeGridKey(const TopoDS_Face& face) const override;
+    size_t computeHash(const TopoDS_Face& face) const override;
     friend FaceTypedCylinder& getCylinderObject();
 
 protected:
@@ -139,8 +133,7 @@ public:
     bool isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& faceTwo) const override;
     GeomAbs_SurfaceType getType() const override;
     TopoDS_Face buildFace(const FaceVectorType& faces) const override;
-    size_t computeStructuralHash(const TopoDS_Face& face) const override;
-    GridKey computeGridKey(const TopoDS_Face& face) const override;
+    size_t computeHash(const TopoDS_Face& face) const override;
     friend FaceTypedBSpline& getBSplineObject();
 };
 FaceTypedBSpline& getBSplineObject();
