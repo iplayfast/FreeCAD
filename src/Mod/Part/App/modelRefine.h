@@ -69,6 +69,7 @@ public:
     virtual bool isEqual(const TopoDS_Face& faceOne, const TopoDS_Face& faceTwo) const = 0;
     virtual GeomAbs_SurfaceType getType() const = 0;
     virtual TopoDS_Face buildFace(const FaceVectorType& faces) const = 0;
+    virtual size_t computeHash(const TopoDS_Face& /*face*/) const { return 0; }
 
     // Compute a deterministic hash of the face's geometric surface data.
     // Faces with the same hash are candidates for being equal; the hash
