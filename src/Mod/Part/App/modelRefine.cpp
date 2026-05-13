@@ -34,6 +34,7 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
+#include <BRepLib.hxx>
 #include <BRepLib_FuseEdges.hxx>
 #include <BRepLib_MakeWire.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -565,11 +566,13 @@ const TopoDS_Face fixFace(const TopoDS_Face& f)
         return dummy;
     }
     faceFixer.FixMissingSeam();
+    faceFixer.SetContext(new ShapeBuild_ReShape());
     faceFixer.Perform();
     if (faceFixer.Status(ShapeExtend_FAIL)) {
         return dummy;
     }
     faceFixer.FixOrientation();
+    faceFixer.SetContext(new ShapeBuild_ReShape());
     faceFixer.Perform();
     if (faceFixer.Status(ShapeExtend_FAIL)) {
         return dummy;
@@ -624,7 +627,15 @@ bool wireEncirclesAxis(const TopoDS_Wire& wire, const Handle(Geom_CylindricalSur
         else {
             // Linearize the edge. Idea taken from ShapeAnalysis.cxx ShapeAnalysis::TotCross2D()
             TColgp_SequenceOfPnt SeqPnt;
-            ShapeAnalysis_Curve::GetSamplePoints(adapt.Curve().Curve(), fp, lp, SeqPnt);
+            // If the edge has no 3d curve try to create it
+            if (adapt.IsCurveOnSurface()) {
+                if (BRepLib::BuildCurves3d(segment)) {
+                    adapt.Initialize(segment);
+                }
+            }
+            if (adapt.Is3DCurve()) {
+                ShapeAnalysis_Curve::GetSamplePoints(adapt.Curve().Curve(), fp, lp, SeqPnt);
+            }
 
             // Calculate the oriented length of the edge
             gp_Pnt begin;
